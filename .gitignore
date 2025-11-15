@@ -1,0 +1,21 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+env/
+venv/
+
+# VS Code
+.vscode/
+
+# Archives / build artifacts
+*.zip
+*.tar
+*.tar.gz
