@@ -1,0 +1,492 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="service.delete_finished"
+       name="Delete After Watching"
+       version="0.0.6"
+       provider-name="pope523">
+  <requires>
+    <import addon="xbmc.python" version="3.0.0" />
+  </requires>
+
+  <!-- Background service that autostarts with Kodi -->
+  <extension point="xbmc.service" library="service.py" />
+
+  <extension point="xbmc.addon.metadata">
+    <summary lang="en_GB">Ask to delete videos when they finish playing</summary>
+    <description lang="en_GB">
+      After a video finishes, show a Yes/No dialog asking whether to delete the file.
+      For TV episodes, only the video file is deleted. For movies, if it is the only
+      video file in its folder, the folder and its accompanying files are deleted as well.
+      Behaviour for episodes and movies can be toggled, and an optional preview of
+      everything that will be deleted can be shown, in the add-on settings.
+    </description>
+    <platform>all</platform>
+  </extension>
+</addon>
+``` :contentReference[oaicite:0]{index=0}  
+
+---
+
+## 2. `resources/settings.xml`
+
+No need to change the logic here; your file was already good. Just make sure it’s saved as **UTF-8 (no BOM)**:
+
+```xml
+<settings version="1">
+  <category label="General">
+    <setting id="run_for_episodes"
+             type="bool"
+             label="Prompt after TV episodes"
+             default="true" />
+    <setting id="run_for_movies"
+             type="bool"
+             label="Prompt after movies"
+             default="true" />
+    <setting id="show_delete_list"
+             type="bool"
+             label="Show detailed list of items that will be deleted"
+             default="true" />
+  </category>
+</settings>
+``` :contentReference[oaicite:1]{index=1}  
+
+---
+
+## 3. `service.py` (updated titles → “Delete After Watching”)
+
+This is your script with the same logic you already had, just with the notification / preview titles updated to match the new add-on name and a tiny bit of whitespace cleanup:
+
+```python
+# service.py - Delete After Watching (v0.0.6)
+#
+# Kodi 19+ / 21.1 Omega compatible.
+#
+# Behaviour:
+#   - Runs as a background service.
+#   - When a video finishes (playback ended), prompts:
+#       "Delete finished video?"
+#   - Respects add-on settings:
+#       * run_for_episodes (bool) - TV episodes
+#       * run_for_movies   (bool) - movies
+#       * show_delete_list (bool) - show detailed list of items to be deleted
+#
+#   - If user chooses "Delete":
+#       * For TV episodes:
+#             - Deletes only the video file (never the folder).
+#       * For movies:
+#             - Deletes the video file.
+#             - If it is the only video file in its folder:
+#                   - Deletes the entire folder and all its contents
+#                     (artwork, .nfo, subtitles, etc.), with a simple
+#                     safety check to avoid deleting generic root
+#                     "Movies", "Videos", etc. folders.
+#       * Removes the item from Kodi's video library using JSON-RPC.
+
+import os
+import json
+
+import xbmc
+import xbmcgui
+import xbmcvfs
+import xbmcaddon
+
+
+ADDON = xbmcaddon.Addon()
+
+
+class AutoDeletePlayer(xbmc.Player):
+    def __init__(self):
+        super().__init__()
+        self.last_file = None
+        self._was_video = False
+
+    # Kodi may call either of these; we handle both
+    def onPlayBackStarted(self):
+        self._update_current_file()
+
+    def onAVStarted(self):
+        self._update_current_file()
+
+    def onPlayBackEnded(self):
+        # Called when playback finishes naturally
+        self._ask_and_delete()
+
+    # Uncomment if you *also* want the prompt when you manually stop playback
+    # def onPlayBackStopped(self):
+    #     self._ask_and_delete()
+
+    def _update_current_file(self):
+        """Remember the current file and whether it's a video."""
+        try:
+            self.last_file = self.getPlayingFile()
+            self._was_video = self.isPlayingVideo()
+        except Exception:
+            self.last_file = None
+            self._was_video = False
+
+    # ==== JSON-RPC helpers ===================================================
+
+    def _json_rpc(self, payload):
+        """Convenience wrapper for xbmc.executeJSONRPC."""
+        try:
+            if isinstance(payload, dict):
+                payload = json.dumps(payload)
+            raw = xbmc.executeJSONRPC(payload)
+            return json.loads(raw)
+        except Exception:
+            return {}
+
+    def _get_library_item(self, path):
+        """
+        Given a file path, try to find the corresponding video-library item.
+
+        Uses Files.GetFileDetails(media="video") which returns an object like:
+          {"filedetails": {"id": 123, "type": "episode", "file": "smb://..."}}
+        """
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "Files.GetFileDetails",
+            "params": {
+                "file": path,
+                "media": "video",
+                "properties": ["file"]
+            }
+        }
+
+        data = self._json_rpc(request)
+        try:
+            details = data.get("result", {}).get("filedetails", {})
+            item_id = details.get("id")
+            item_type = details.get("type")  # "movie", "episode", "musicvideo", "tvshow"
+            if item_id is not None and item_type:
+                return item_type, item_id
+        except Exception:
+            pass
+
+        return None, None
+
+    def _remove_from_library(self, item_type, item_id):
+        """
+        Remove the given item from Kodi's video library.
+
+        Maps type -> VideoLibrary.Remove* call:
+          movie      -> VideoLibrary.RemoveMovie
+          episode    -> VideoLibrary.RemoveEpisode
+          musicvideo -> VideoLibrary.RemoveMusicVideo
+          tvshow     -> VideoLibrary.RemoveTVShow
+        """
+        method = None
+        arg_name = None
+
+        if item_type == "movie":
+            method = "VideoLibrary.RemoveMovie"
+            arg_name = "movieid"
+        elif item_type == "episode":
+            method = "VideoLibrary.RemoveEpisode"
+            arg_name = "episodeid"
+        elif item_type == "musicvideo":
+            method = "VideoLibrary.RemoveMusicVideo"
+            arg_name = "musicvideoid"
+        elif item_type == "tvshow":
+            method = "VideoLibrary.RemoveTVShow"
+            arg_name = "tvshowid"
+
+        if not method or not arg_name:
+            return False
+
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": {arg_name: int(item_id)},
+        }
+
+        data = self._json_rpc(request)
+        # Kodi methods typically return {"result":"OK"} on success
+        return data.get("result") == "OK"
+
+    # ==== File / folder delete logic ========================================
+
+    @staticmethod
+    def _is_leaf_movie_folder(folder_name):
+        """
+        Simple safety check: avoid deleting generic roots like "Movies", "Videos", etc.
+        Only allow deletion if the folder name doesn't look like a generic library root.
+        """
+        bad_names = {
+            "", "movies", "movie", "films", "film",
+            "video", "videos", "media", "tv", "shows", "series"
+        }
+        return folder_name.lower() not in bad_names
+
+    @staticmethod
+    def _join_vfs_path(folder, name):
+        """Join a VFS path safely using forward slashes (for smb://, nfs://, etc.)."""
+        return folder.rstrip("/\\") + "/" + name
+
+    def _build_delete_plan(self, path, item_type):
+        """
+        Build a description of what will be deleted, without actually deleting anything.
+
+        Returns a dict:
+          {
+            "file": <main file path>,
+            "folder_delete": True/False,
+            "folder": <folder path or None>,
+            "extra_items": [list of additional file/folder paths],
+          }
+        """
+        cleaned = path.rstrip("/\\")
+        plan = {
+            "file": cleaned,
+            "folder_delete": False,
+            "folder": None,
+            "extra_items": [],
+        }
+
+        # Only movies potentially delete the parent folder
+        if item_type != "movie":
+            return plan
+
+        folder = os.path.dirname(cleaned)
+        if not folder:
+            return plan
+
+        dirs, files = xbmcvfs.listdir(folder)
+        filename = os.path.basename(cleaned)
+
+        # video files in this folder
+        video_exts = (
+            ".mkv", ".mp4", ".avi", ".mov", ".flv", ".wmv",
+            ".mpeg", ".mpg", ".m4v", ".ts", ".m2ts", ".iso", ".bdmv"
+        )
+        video_files = [f for f in files if f.lower().endswith(video_exts)]
+
+        # simulate "after deleting this file" by removing it from the list
+        video_files_minus_current = [f for f in video_files if f != filename]
+        only_video = len(video_files_minus_current) == 0
+
+        if not only_video:
+            # We will only delete the movie file itself.
+            return plan
+
+        folder_name = folder.rstrip("/\\").split("/")[-1]
+        if not self._is_leaf_movie_folder(folder_name):
+            # Avoid deleting generic top-level library folders
+            return plan
+
+        plan["folder_delete"] = True
+        plan["folder"] = folder
+
+        # extra_items = everything else in this folder (files and subfolders)
+        for f in files:
+            full = self._join_vfs_path(folder, f)
+            if full == cleaned:
+                continue
+            plan["extra_items"].append(full)
+
+        for d in dirs:
+            full_d = self._join_vfs_path(folder, d) + "/"
+            plan["extra_items"].append(full_d)
+
+        return plan
+
+    def _delete_single_file(self, path):
+        """Delete just the video file."""
+        return xbmcvfs.delete(path)
+
+    def _delete_movie_and_maybe_folder(self, path):
+        """
+        Delete movie file. If it's the only video file in its folder,
+        delete the folder and all its contents as well (art, .nfo, subs, etc.).
+
+        Returns (file_deleted, folder_deleted).
+        """
+        cleaned = path.rstrip("/\\")
+        folder = os.path.dirname(cleaned)
+
+        # Delete the file first
+        file_deleted = xbmcvfs.delete(cleaned)
+        if not file_deleted or not folder:
+            return file_deleted, False
+
+        # Now see if any video files remain in the folder
+        dirs, files = xbmcvfs.listdir(folder)
+
+        video_exts = (
+            ".mkv", ".mp4", ".avi", ".mov", ".flv", ".wmv",
+            ".mpeg", ".mpg", ".m4v", ".ts", ".m2ts", ".iso", ".bdmv"
+        )
+        video_files = [f for f in files if f.lower().endswith(video_exts)]
+
+        # If there are still video files, don't delete the folder
+        if len(video_files) > 0:
+            return True, False
+
+        folder_name = folder.rstrip("/\\").split("/")[-1]
+        if not self._is_leaf_movie_folder(folder_name):
+            return True, False
+
+        # Recursively remove folder and contents
+        folder_deleted = xbmcvfs.rmdir(folder, True)
+        return True, folder_deleted
+
+    # ==== UI / main flow =====================================================
+
+    def _show_delete_preview(self, plan):
+        """Show a text viewer listing all items that will be deleted."""
+        lines = []
+
+        lines.append("File that will be deleted:")
+        lines.append("  " + plan["file"])
+
+        if plan["folder_delete"]:
+            if plan["extra_items"]:
+                lines.append("")
+                lines.append("Additional items in the movie folder:")
+                # Avoid going totally crazy if the folder has tons of files
+                max_show = 50
+                for p in plan["extra_items"][:max_show]:
+                    lines.append("  " + p)
+                if len(plan["extra_items"]) > max_show:
+                    remaining = len(plan["extra_items"]) - max_show
+                    lines.append(f"  ...and {remaining} more item(s)")
+
+            lines.append("")
+            lines.append("Folder that will be deleted:")
+            lines.append("  " + plan["folder"])
+            lines.append("  (All files and subfolders under this folder)")
+
+        text = "\n".join(lines)
+        xbmcgui.Dialog().textviewer("Delete After Watching - Preview", text)
+
+    def _ask_and_delete(self):
+        """Prompt user, delete file appropriately, and update library."""
+        if not self.last_file or not self._was_video:
+            return
+
+        path = self.last_file
+
+        # Ignore plugin:// etc. — nothing to delete on disk
+        if path.startswith("plugin://"):
+            return
+
+        # Only proceed if the path exists in Kodi VFS (local or smb://)
+        if not xbmcvfs.exists(path):
+            return
+
+        filename = os.path.basename(path.rstrip("/\\")) or path
+
+        # Look up library item *before* deleting the file
+        item_type, item_id = self._get_library_item(path)
+
+        # Load settings
+        run_for_episodes = ADDON.getSettingBool("run_for_episodes")
+        run_for_movies = ADDON.getSettingBool("run_for_movies")
+        show_delete_list = ADDON.getSettingBool("show_delete_list")
+
+        # If we know the type, respect the corresponding setting
+        if item_type == "episode" and not run_for_episodes:
+            return
+        if item_type == "movie" and not run_for_movies:
+            return
+
+        # If item_type is None or something else, we still allow prompt
+        # as long as at least one of the settings is enabled.
+        if item_type not in ("episode", "movie"):
+            if not (run_for_episodes or run_for_movies):
+                return
+
+        # Build a delete plan to preview, if desired
+        plan = self._build_delete_plan(path, item_type)
+        if show_delete_list:
+            self._show_delete_preview(plan)
+
+        heading = "Delete finished video?"
+        line1 = filename
+        if item_type == "movie":
+            line2 = (
+                "Delete this movie? Depending on folder contents, the entire "
+                "movie folder may also be removed."
+            )
+        else:
+            line2 = "Do you want to delete this file?"
+
+        dialog = xbmcgui.Dialog()
+
+        delete_it = dialog.yesno(
+            heading,
+            line1,
+            line2,
+            "",
+            nolabel="Keep",
+            yeslabel="Delete",
+        )
+
+        if not delete_it:
+            return
+
+        # === Delete file/folder depending on type ===========================
+
+        file_deleted = False
+        folder_deleted = False
+
+        if item_type == "movie":
+            file_deleted, folder_deleted = self._delete_movie_and_maybe_folder(path)
+        else:
+            # TV episodes, unknown types, etc.: delete file only
+            file_deleted = self._delete_single_file(path)
+
+        if not file_deleted:
+            xbmcgui.Dialog().notification(
+                "Delete After Watching",
+                "Could not delete file (check SMB permissions).",
+                xbmcgui.NOTIFICATION_ERROR,
+                4000,
+            )
+            return
+
+        # === Remove from library, if we have a library item =================
+
+        removed_from_lib = False
+        if item_type and item_id is not None:
+            removed_from_lib = self._remove_from_library(item_type, item_id)
+
+        # === Notify user ====================================================
+
+        msg = f"Deleted: {filename}"
+        if folder_deleted:
+            msg += " (folder removed)"
+        if removed_from_lib:
+            msg += " (library updated)"
+
+        xbmcgui.Dialog().notification(
+            "Delete After Watching",
+            msg,
+            xbmcgui.NOTIFICATION_INFO,
+            4000,
+        )
+
+
+if __name__ == "__main__":
+    monitor = xbmc.Monitor()
+    player = AutoDeletePlayer()
+
+    # Stay alive so our Player callbacks keep working
+    while not monitor.abortRequested():
+        if monitor.waitForAbort(1):
+            break
+``` :contentReference[oaicite:2]{index=2}  
+
+---
+
+## 4. How to deploy these safely
+
+1. On your PC, create this structure:
+
+   ```text
+   service.delete_finished/
+     addon.xml        (the 0.0.6 version above)
+     service.py       (the updated one above)
+     resources/
+       settings.xml   (as above)

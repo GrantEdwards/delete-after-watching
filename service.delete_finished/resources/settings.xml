@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<settings>
+  <category label="General">
+    <setting id="run_for_episodes"
+             type="bool"
+             label="Prompt after TV episodes"
+             default="true" />
+    <setting id="run_for_movies"
+             type="bool"
+             label="Prompt after movies"
+             default="true" />
+    <setting id="show_delete_list"
+             type="bool"
+             label="Show detailed list of items that will be deleted"
+             default="true" />
+  </category>
+</settings>
