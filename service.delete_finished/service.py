@@ -286,8 +286,7 @@ class AutoDeletePlayer(xbmc.Player):
 
         delete_it = dialog.yesno(
             heading,
-            line1,
-            line2,
+            line1+'\n'+line2,
             nolabel="Keep",
             yeslabel="Delete",
         )
